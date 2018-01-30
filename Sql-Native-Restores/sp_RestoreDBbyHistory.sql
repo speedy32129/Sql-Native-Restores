@@ -18,11 +18,15 @@ CREATE PROCEDURE [dbo].[sp_RestoreDBbyHistory]
 (
     @SourceDB VARCHAR(200)
   , @DestinationDB VARCHAR(200) = NULL
-  , @RestoreToTime DATETIME = NULL         --'yyyy-mm-dd hh:mi:ss', ie. '2012-04-27 22:19:20'
-  , @RecoveryMode VARCHAR(10) = 'Recovery' --'Recovery' or 'Norecovery'
-  , @ListMode VARCHAR(10) = 'OnlyValid'    --'All' or 'OnlyValid'
+  , @RestoreToTime DATETIME = NULL            --'yyyy-mm-dd hh:mi:ss', ie. '2012-04-27 22:19:20'
+  , @RecoveryMode VARCHAR(10) = 'Recovery'    --'Recovery' or 'Norecovery'
+  , @ListMode VARCHAR(10) = 'OnlyValid'       --'All' or 'OnlyValid'
   , @ProgressValue INT = 1
-  , @MirroringRestore BIT = 0              -- Added by Jim for mirroring restores
+  , @MirroringRestore BIT = 0                 -- Added by Jim for mirroring restores
+  , @SQLLocationOneDrive varchar(250) = NULL  -- Used for resoring to different server with a different path
+  , @SQLLocationData varchar(250) = NULL      -- Used for resoring to different server with a different path
+  , @SQLLocationLogs varchar(250) = NULL      -- Used for resoring to different server with a different path
+  , @SQLLocationOther varchar(250) = NULL     -- Used for resoring to different server with a different path
 )
 AS
 /*********************************************************************************************
@@ -106,20 +110,20 @@ BEGIN
     --Find the last valid full backup
     SELECT TOP 1
            @first_backup_set_id = backup_set_id
-    FROM msdb..backupset bs
+    FROM msdb.dbo.backupset bs WITH ( NOLOCK )
     WHERE bs.type = 'D'
           AND bs.backup_start_date <= @RestoreToTime
           AND bs.database_name = @SourceDB
-		  AND bs.is_copy_only = 0                          -- Add Jim to ignore copy only backups as they are non-recoverable
+          AND bs.is_copy_only = 0                          -- Add Jim to ignore copy only backups as they are non-recoverable
     ORDER BY bs.backup_start_date DESC;
 
     IF (@first_backup_set_id IS NULL)
     BEGIN
         SELECT @first_backup_set_id = MIN(bs.backup_set_id)
-        FROM msdb..backupset bs
+        FROM msdb.dbo.backupset bs WITH ( NOLOCK )
         WHERE bs.database_name = @SourceDB
               AND bs.backup_start_date <= @RestoreToTime
-			  AND bs.is_copy_only = 0;                     -- Add Jim to ignore copy only backups as they are non-recoverable
+              AND bs.is_copy_only = 0;                     -- Add Jim to ignore copy only backups as they are non-recoverable
 
         IF (@first_backup_set_id IS NULL)
         BEGIN
@@ -134,26 +138,60 @@ BEGIN
     BEGIN
         SELECT @MOVETO
             = @MOVETO + 'MOVE N''' + bf.logical_name + ''' TO N'''
-              + REVERSE(RIGHT(REVERSE(bf.physical_name), (LEN(bf.physical_name) - CHARINDEX('\', REVERSE(bf.physical_name), 1)) + 1))
+              -- Set Path
+              + CASE
+                    WHEN bf.file_number = 1 THEN
+                        -- Data
+                        COALESCE(
+                                    @SQLLocationOneDrive
+                                  , @SQLLocationData
+                                  , REVERSE(RIGHT(REVERSE(bf.physical_name), (LEN(bf.physical_name) - CHARINDEX('\', REVERSE(bf.physical_name), 1)) + 1))
+                                )
+                    WHEN (bf.file_number <> 1)
+                         AND (bf.file_type = 'L') THEN
+                        -- Log
+                        COALESCE(
+                                    @SQLLocationOneDrive
+                                  , @SQLLocationLogs
+                                  , REVERSE(RIGHT(REVERSE(bf.physical_name), (LEN(bf.physical_name) - CHARINDEX('\', REVERSE(bf.physical_name), 1)) + 1))
+                                )
+                    WHEN (bf.file_number <> 1)
+                         AND (bf.file_type = 'D') THEN
+                        -- Known NDF
+                        COALESCE(
+                                    @SQLLocationOneDrive
+                                  , @SQLLocationOther
+                                  , REVERSE(RIGHT(REVERSE(bf.physical_name), (LEN(bf.physical_name) - CHARINDEX('\', REVERSE(bf.physical_name), 1)) + 1))
+                                )
+                    ELSE
+                        -- Other NDF
+                        COALESCE(
+                                    @SQLLocationOneDrive
+                                  , @SQLLocationOther
+                                  , REVERSE(RIGHT(REVERSE(bf.physical_name), (LEN(bf.physical_name) - CHARINDEX('\', REVERSE(bf.physical_name), 1)) + 1))
+                                )
+                END
+              -- Set FileName
               + CASE
                     WHEN bf.file_number = 1 THEN
                         @DestinationDB + '_data.mdf'
                     WHEN (bf.file_number <> 1)
                          AND (bf.file_type = 'L') THEN
-                        @DestinationDB + '_log' + CONVERT(VARCHAR(3), bf.file_number) + '.ldf'
+                        --@DestinationDB + '_log' + CONVERT(VARCHAR(3), bf.file_number) + '.ldf'
+                        @DestinationDB + '_log.ldf'
                     WHEN (bf.file_number <> 1)
                          AND (bf.file_type = 'D') THEN
                         @DestinationDB + '_data' + CONVERT(VARCHAR(3), bf.file_number) + '.ndf'
                     ELSE
                         @DestinationDB + '_' + CONVERT(VARCHAR(3), bf.file_number) + '.ndf'
                 END + ''','
-        FROM msdb..backupfile bf
-        LEFT JOIN msdb..backupset bs
+        FROM msdb.dbo.backupfile bf WITH (NOLOCK)
+        LEFT JOIN msdb.dbo.backupset bs WITH (NOLOCK)
             ON bf.backup_set_id = bs.backup_set_id
         WHERE bf.backup_set_id = @first_backup_set_id
-			AND bs.is_copy_only = 0                        -- Add Jim to ignore copy only backups as they are non-recoverable
-        
-		SET @MOVETO_temp = @MOVETO;
+              AND bs.is_copy_only = 0;                     -- Add Jim to ignore copy only backups as they are non-recoverable
+
+        SET @MOVETO_temp = @MOVETO;
 
     END;
 
@@ -195,12 +233,12 @@ BEGIN
          , bs.backup_size
          , bmf.physical_device_name
          , bs.name AS backupset_name
-    FROM msdb.dbo.backupmediafamily bmf
-    INNER JOIN msdb.dbo.backupset bs
+    FROM msdb.dbo.backupmediafamily bmf WITH ( NOLOCK )
+    INNER JOIN msdb.dbo.backupset bs WITH ( NOLOCK )
         ON bmf.media_set_id = bs.media_set_id
     WHERE bs.database_name = @SourceDB
           AND bs.backup_set_id >= @first_backup_set_id
-		  AND bs.is_copy_only = 0                          -- Add Jim to ignore copy only backups as they are non-recoverable
+          AND bs.is_copy_only = 0 -- Add Jim to ignore copy only backups as they are non-recoverable
     ORDER BY bs.backup_start_date;
 
     OPEN backup_cursor;
@@ -243,12 +281,18 @@ BEGIN
                 SET @MOVETO_temp = '';
             SET @restore_command
                 = CASE
-                      WHEN @backup_type IN ( 'Full', 'Diff' ) THEN
-                          'RESTORE DATABASE [' + @DestinationDB + '] FROM DISK = N''' + @physical_device_name + ''' WITH  FILE = ' + CONVERT(VARCHAR(3), @position) + ','
-                          + @MOVETO_temp + 'NORECOVERY, NOUNLOAD, STATS = ' + CAST(@ProgressValue AS VARCHAR(20))
+                      WHEN @backup_type = 'Full' THEN
+                          'RESTORE DATABASE [' + @DestinationDB + '] FROM DISK = N''' + @physical_device_name
+                          + ''' WITH  FILE = ' + CONVERT(VARCHAR(3), @position) + ', ' + @MOVETO_temp
+                          + 'NORECOVERY, NOUNLOAD, REPLACE, STATS = ' + CAST(@ProgressValue AS VARCHAR(20))
+                      WHEN @backup_type = 'Diff' THEN
+                          'RESTORE DATABASE [' + @DestinationDB + '] FROM DISK = N''' + @physical_device_name
+                          + ''' WITH  FILE = ' + CONVERT(VARCHAR(3), @position) + ', ' + @MOVETO_temp
+                          + 'NORECOVERY, NOUNLOAD, STATS = ' + CAST(@ProgressValue AS VARCHAR(20))
                       WHEN @backup_type = 'Log' THEN
-                          'RESTORE LOG [' + @DestinationDB + '] FROM DISK = N''' + @physical_device_name + ''' WITH  FILE = ' + CONVERT(VARCHAR(3), @position) + ','
-                          + @MOVETO_temp + 'NORECOVERY, NOUNLOAD, STATS = ' + CAST(@ProgressValue AS VARCHAR(20))
+                          'RESTORE LOG [' + @DestinationDB + '] FROM DISK = N''' + @physical_device_name
+                          + ''' WITH  FILE = ' + CONVERT(VARCHAR(3), @position) + ', ' + @MOVETO_temp
+                          + 'NORECOVERY, NOUNLOAD, STATS = ' + CAST(@ProgressValue AS VARCHAR(20))
                   END;
 
             INSERT INTO #RestoreCommand
@@ -314,7 +358,7 @@ BEGIN
     CLOSE backup_cursor;
     DEALLOCATE backup_cursor;
 
-	-- accept last file as for recovery if not doing mirroring restore -- added by Jim
+    -- accept last file as for recovery if not doing mirroring restore -- added by Jim
     IF (@lastfile <> 1 AND @MirroringRestore = 0)
     BEGIN
         -- Get max id
@@ -339,8 +383,8 @@ BEGIN
         )
         VALUES
         ('You need to back up the Tail of the Log on database [' + @SourceDB + '] before restoring, then restore the tail-log backup with recovery as last step!');
-    
-	SELECT *
+
+    SELECT *
     FROM #RestoreCommand
     ORDER BY [ID];
     DROP TABLE #RestoreCommand;
