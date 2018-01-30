@@ -238,7 +238,7 @@ BEGIN
         ON bmf.media_set_id = bs.media_set_id
     WHERE bs.database_name = @SourceDB
           AND bs.backup_set_id >= @first_backup_set_id
-          AND bs.is_copy_only = 0 -- Add Jim to ignore copy only backups as they are non-recoverable
+          AND bs.is_copy_only = 0                          -- Add Jim to ignore copy only backups as they are non-recoverable
     ORDER BY bs.backup_start_date;
 
     OPEN backup_cursor;
@@ -358,7 +358,33 @@ BEGIN
     CLOSE backup_cursor;
     DEALLOCATE backup_cursor;
 
-    -- accept last file as for recovery if not doing mirroring restore -- added by Jim
+	-- fix 20180129 Jim
+	-- Validate
+	-- So in testing I found a bug in the output from a differential to the log.  
+	-- Sometimes the log lsns are include in the differential or the restore script 
+	-- would fail on the extra log files.
+	--
+	-- The problem may exist off the full to the log ... Haven't had that one yet
+	-- as most of my database have differents.
+
+	-- check if different exist
+	-- get the differentials last lsn
+	DECLARE @DiffLastLsn NUMERIC(25,0)
+
+	SET @DiffLastLsn = (SELECT Last_lsn FROM #RestoreCommand WHERE backup_type = 'diff')
+
+	-- remove any logs that the last_lsn is not > the last lsn of the differential.
+	IF @DiffLastLsn IS NOT NULL
+    BEGIN
+		
+		DELETE 
+		FROM #RestoreCommand 
+		WHERE backup_type = 'Log'
+		AND last_lsn < @DiffLastLsn
+
+	End
+
+    -- accept last file as for recovery if not doing mirroring restore
     IF (@lastfile <> 1 AND @MirroringRestore = 0)
     BEGIN
         -- Get max id
@@ -382,7 +408,9 @@ BEGIN
             restore_command
         )
         VALUES
-        ('You need to back up the Tail of the Log on database [' + @SourceDB + '] before restoring, then restore the tail-log backup with recovery as last step!');
+        ('-- You need to back up the Tail of the Log on database [' + @SourceDB
+         + '] before restoring, then restore the tail-log backup with recovery as last step!');
+
 
     SELECT *
     FROM #RestoreCommand
